@@ -1,0 +1,28 @@
+name: Classify HubSpot Meeting Types
+ 
+on:
+  schedule:
+    - cron: '59 23 * * *'  # Every day at 23:59 UTC
+  workflow_dispatch:        # Allow manual trigger from GitHub UI
+ 
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+ 
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+ 
+      - name: Install dependencies
+        run: pip install requests
+ 
+      - name: Run classifier
+        env:
+          HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
+        run: python3 update_meeting_types.py --api-key "$HUBSPOT_API_KEY"
+ 
