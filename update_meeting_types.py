@@ -25,16 +25,40 @@ except ImportError:
 
 PROPERTY = "meeting_type"
 
-# Owners whose meetings always get their team's type. Each entry is the list of
-# spellings accepted for one person, matched case-insensitively against
-# "<firstName> <lastName>" from the HubSpot owners API; one match is enough, and
-# a person no spelling matches aborts the run.
+
+def hubspot_get(url, api_key, params, required=True):
+    """GET that fails loudly — an unchecked error body reads as 'no results'.
+
+    With required=False a failure returns None instead of aborting, for calls
+    the run can do without.
+    """
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        params=params,
+    )
+    if resp.status_code != 200:
+        label = "ERROR" if required else "WARNING"
+        print(f"{label}: GET {url} returned HTTP {resp.status_code}")
+        print(f"  {resp.text[:400]}")
+        if resp.status_code in (401, 403):
+            print("  Check that the token is set and the private app has the "
+                  "crm.objects.meetings.read/write and crm.objects.owners.read scopes.")
+        if not required:
+            return None
+        sys.exit(1)
+    return resp.json()
+
+# Owners whose meetings always get their team's type, keyed by HubSpot owner id
+# so the rule does not depend on the owners API being readable. The name is a
+# label; it is cross-checked against the owners API when that call succeeds, and
+# a mismatch warns rather than aborts.
 TEAMS = {
     "CS": {
         "owners": [
-            ["felicia stuhlhofer"],
-            ["josefine skoglund"],
-            ["fanny frostelind"],
+            ("33027515", "Felicia Stuhlhofer"),
+            ("1714569923", "Josefine Skoglund"),
+            ("34685500", "Fanny Frostelind"),
         ],
         "types": {
             "CS onboarding",
@@ -47,10 +71,10 @@ TEAMS = {
     },
     "Sales": {
         "owners": [
-            ["david gyllensten"],
-            ["anton boså", "anton bosa"],
-            ["victor johansson", "viktor johansson"],
-            ["oskar karnblad"],
+            ("77124688", "David Gyllensten"),
+            ("31025881", "Anton Boså"),
+            ("36611425", "Victor Johansson"),
+            ("1640423630", "Oskar Karnblad"),
         ],
         "types": {
             "First sales meeting",
@@ -180,9 +204,12 @@ def classify(name):
     return None  # Don't set anything if we can't classify
 
 
-def fetch_owner_index(api_key):
-    """Every HubSpot owner as {"<first> <last>" lowercased: id}."""
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+def fetch_owner_names(api_key):
+    """Every HubSpot owner as {id: "<first> <last>"}, for verifying TEAMS.
+
+    Best-effort: returns {} if the owners scope is missing, since the team rules
+    are keyed by owner id and only use these names to sanity-check the config.
+    """
     index = {}
     after = None
 
@@ -191,17 +218,16 @@ def fetch_owner_index(api_key):
         if after:
             params["after"] = after
 
-        resp = requests.get(
-            "https://api.hubapi.com/crm/v3/owners",
-            headers=headers,
-            params=params
-        )
-        data = resp.json()
+        data = hubspot_get("https://api.hubapi.com/crm/v3/owners", api_key,
+                           params, required=False)
+        if data is None:
+            print("  Could not read the owner list; continuing with the "
+                  "owner ids in TEAMS unverified.")
+            return {}
 
         for o in data.get("results", []):
-            full = f"{o.get('firstName') or ''} {o.get('lastName') or ''}".strip().lower()
-            if full:
-                index[full] = str(o["id"])
+            full = f"{o.get('firstName') or ''} {o.get('lastName') or ''}".strip()
+            index[str(o["id"])] = full or (o.get("email") or "")
 
         after = data.get("paging", {}).get("next", {}).get("after")
         if not after:
@@ -212,38 +238,33 @@ def fetch_owner_index(api_key):
     return index
 
 
-def resolve_team_owners(index):
-    """Map each owner id to its team name. Aborts on an unmatched or shared owner."""
+def resolve_team_owners(owner_names):
+    """Map each owner id to its team. Warns if a configured id looks wrong."""
     owner_team = {}
-    missing = []
 
     for team, cfg in TEAMS.items():
-        for aliases in cfg["owners"]:
-            matched = [index[a] for a in aliases if a in index]
-            if not matched:
-                missing.append((team, aliases))
-                continue
-            for oid in matched:
-                if owner_team.get(oid, team) != team:
-                    print(f"ERROR: owner {oid} ({aliases[0]}) is listed under both "
-                          f"{owner_team[oid]} and {team}.")
-                    sys.exit(1)
-                owner_team[oid] = team
-                print(f"  {team} owner: {aliases[0]} -> {oid}")
+        for oid, label in cfg["owners"]:
+            if oid in owner_team:
+                print(f"ERROR: owner {oid} ({label}) is listed under both "
+                      f"{owner_team[oid]} and {team}.")
+                sys.exit(1)
+            owner_team[oid] = team
 
-    if missing:
-        for team, aliases in missing:
-            print(f"ERROR: no HubSpot owner found for {team} member "
-                  f"{' / '.join(aliases)}")
-        print("Check the spelling in TEAMS against the owner's HubSpot profile.")
-        sys.exit(1)
+            actual = owner_names.get(oid) if owner_names else label
+            if actual is None:
+                print(f"  WARNING: {team} owner {label} ({oid}) is not in this "
+                      f"portal's owner list — its meetings will never match.")
+            elif actual.strip().lower() != label.strip().lower():
+                print(f"  WARNING: owner {oid} is configured as {label} but HubSpot "
+                      f"calls it {actual}. Using the id.")
+            else:
+                print(f"  {team} owner: {label} ({oid})")
 
     return owner_team
 
 
 def fetch_candidates(api_key, owner_team):
     """Meetings needing a write: no type yet, or a team owner with an off-team type."""
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     results = []
     after = None
 
@@ -255,12 +276,8 @@ def fetch_candidates(api_key, owner_team):
         if after:
             params["after"] = after
 
-        resp = requests.get(
-            "https://api.hubapi.com/crm/v3/objects/meetings",
-            headers=headers,
-            params=params
-        )
-        data = resp.json()
+        data = hubspot_get("https://api.hubapi.com/crm/v3/objects/meetings",
+                           api_key, params)
 
         for obj in data.get("results", []):
             props = obj.get("properties", {})
@@ -304,7 +321,7 @@ def update_meetings(api_key, dry_run=False):
         print("DRY RUN — nothing will be written to HubSpot.\n")
 
     print("Resolving team owners...")
-    owner_team = resolve_team_owners(fetch_owner_index(api_key))
+    owner_team = resolve_team_owners(fetch_owner_names(api_key))
 
     print("Fetching meetings to classify...")
     records = fetch_candidates(api_key, owner_team)
