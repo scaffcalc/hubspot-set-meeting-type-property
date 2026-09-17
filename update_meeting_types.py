@@ -3,6 +3,12 @@ HubSpot Meeting Type Bulk Updater
 ----------------------------------
 Fetches all meetings where meeting_type is empty, classifies by name, updates.
 
+Meetings owned by a team in TEAMS are always given one of that team's types:
+anything the name-based classifier returns that isn't in the team's set — the
+other team's types, Partnership, Other, or no match at all — is forced to the
+team's fallback. For those owners the meetings that already carry an off-team
+type are corrected too, not just the empty ones.
+
 Usage:
     python3 update_meeting_types.py --api-key YOUR_SERVICE_KEY
 """
@@ -18,6 +24,42 @@ except ImportError:
     sys.exit(1)
 
 PROPERTY = "meeting_type"
+
+# Owners whose meetings always get their team's type. Each entry is the list of
+# spellings accepted for one person, matched case-insensitively against
+# "<firstName> <lastName>" from the HubSpot owners API; one match is enough, and
+# a person no spelling matches aborts the run.
+TEAMS = {
+    "CS": {
+        "owners": [
+            ["felicia stuhlhofer"],
+            ["josefine skoglund"],
+            ["fanny frostelind"],
+        ],
+        "types": {
+            "CS onboarding",
+            "CS training",
+            "CS product meeting",
+            "CS license meeting",
+            "CS check-in",
+        },
+        "fallback": "CS check-in",
+    },
+    "Sales": {
+        "owners": [
+            ["david gyllensten"],
+            ["anton boså", "anton bosa"],
+            ["victor johansson", "viktor johansson"],
+            ["oskar karnblad"],
+        ],
+        "types": {
+            "First sales meeting",
+            "Follow-up sales meeting",
+            "Trial check-in",
+        },
+        "fallback": "Follow-up sales meeting",
+    },
+}
 
 def classify(name):
     if not name or not name.strip():
@@ -138,7 +180,69 @@ def classify(name):
     return None  # Don't set anything if we can't classify
 
 
-def fetch_unclassified(api_key):
+def fetch_owner_index(api_key):
+    """Every HubSpot owner as {"<first> <last>" lowercased: id}."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    index = {}
+    after = None
+
+    while True:
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+
+        resp = requests.get(
+            "https://api.hubapi.com/crm/v3/owners",
+            headers=headers,
+            params=params
+        )
+        data = resp.json()
+
+        for o in data.get("results", []):
+            full = f"{o.get('firstName') or ''} {o.get('lastName') or ''}".strip().lower()
+            if full:
+                index[full] = str(o["id"])
+
+        after = data.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+
+        time.sleep(0.05)
+
+    return index
+
+
+def resolve_team_owners(index):
+    """Map each owner id to its team name. Aborts on an unmatched or shared owner."""
+    owner_team = {}
+    missing = []
+
+    for team, cfg in TEAMS.items():
+        for aliases in cfg["owners"]:
+            matched = [index[a] for a in aliases if a in index]
+            if not matched:
+                missing.append((team, aliases))
+                continue
+            for oid in matched:
+                if owner_team.get(oid, team) != team:
+                    print(f"ERROR: owner {oid} ({aliases[0]}) is listed under both "
+                          f"{owner_team[oid]} and {team}.")
+                    sys.exit(1)
+                owner_team[oid] = team
+                print(f"  {team} owner: {aliases[0]} -> {oid}")
+
+    if missing:
+        for team, aliases in missing:
+            print(f"ERROR: no HubSpot owner found for {team} member "
+                  f"{' / '.join(aliases)}")
+        print("Check the spelling in TEAMS against the owner's HubSpot profile.")
+        sys.exit(1)
+
+    return owner_team
+
+
+def fetch_candidates(api_key, owner_team):
+    """Meetings needing a write: no type yet, or a team owner with an off-team type."""
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     results = []
     after = None
@@ -146,7 +250,7 @@ def fetch_unclassified(api_key):
     while True:
         params = {
             "limit": 100,
-            "properties": "hs_meeting_title,meeting_type",
+            "properties": "hs_meeting_title,meeting_type,hubspot_owner_id",
         }
         if after:
             params["after"] = after
@@ -160,11 +264,19 @@ def fetch_unclassified(api_key):
 
         for obj in data.get("results", []):
             props = obj.get("properties", {})
-            if not props.get("meeting_type"):
-                results.append({
-                    "id": obj["id"],
-                    "name": props.get("hs_meeting_title", "") or ""
-                })
+            current = props.get("meeting_type")
+            team = owner_team.get(str(props.get("hubspot_owner_id") or ""))
+            off_team = team and current not in TEAMS[team]["types"]
+
+            if current and not off_team:
+                continue
+
+            results.append({
+                "id": obj["id"],
+                "name": props.get("hs_meeting_title", "") or "",
+                "current": current or "",
+                "team": team,
+            })
 
         paging = data.get("paging", {})
         after = paging.get("next", {}).get("after")
@@ -176,23 +288,48 @@ def fetch_unclassified(api_key):
     return results
 
 
-def update_meetings(api_key):
+def resolve_type(record):
+    """Final meeting type for a record, or None to leave it alone."""
+    meeting_type = classify(record["name"])
+    team = record["team"]
+    if team and meeting_type not in TEAMS[team]["types"]:
+        return TEAMS[team]["fallback"]
+    return meeting_type
+
+
+def update_meetings(api_key, dry_run=False):
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    print("Fetching unclassified meetings...")
-    records = fetch_unclassified(api_key)
-    print(f"Found {len(records)} meetings without Meeting Type")
+    if dry_run:
+        print("DRY RUN — nothing will be written to HubSpot.\n")
+
+    print("Resolving team owners...")
+    owner_team = resolve_team_owners(fetch_owner_index(api_key))
+
+    print("Fetching meetings to classify...")
+    records = fetch_candidates(api_key, owner_team)
+    empty = sum(1 for r in records if not r["current"])
+    corrections = len(records) - empty
+    print(f"Found {empty} meetings without Meeting Type"
+          f" and {corrections} team-owned meetings with an off-team type to correct")
 
     if not records:
         print("Nothing to update.")
         return
 
-    success, skipped, failed = 0, 0, []
+    success, skipped, failed, overridden = 0, 0, [], []
 
     for i, r in enumerate(records):
-        meeting_type = classify(r["name"])
+        meeting_type = resolve_type(r)
         if not meeting_type:
             skipped += 1
+            continue
+
+        if r["current"] and r["current"] != meeting_type:
+            overridden.append((r["team"], r["name"], r["current"], meeting_type))
+
+        if dry_run:
+            success += 1
             continue
 
         resp = requests.patch(
@@ -211,7 +348,13 @@ def update_meetings(api_key):
 
         time.sleep(0.07)
 
-    print(f"\nDone. {success} updated, {skipped} skipped (unclassifiable), {len(failed)} failed.")
+    verb = "would be updated" if dry_run else "updated"
+    print(f"\nDone. {success} {verb}, {skipped} skipped (unclassifiable), {len(failed)} failed.")
+    if overridden:
+        replaced = "would have their existing type replaced" if dry_run else "had their existing type replaced"
+        print(f"\n{len(overridden)} team-owned meetings {replaced}:")
+        for team, oname, old, new in sorted(overridden):
+            print(f"  [{team}] {oname!r}: {old} -> {new}")
     if failed:
         for fid, fname, fcode, fmsg in failed:
             print(f"  FAILED {fid} ({fname!r}): HTTP {fcode} — {fmsg[:120]}")
@@ -220,5 +363,7 @@ def update_meetings(api_key):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--api-key", required=True)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print what would change without writing to HubSpot")
     args = parser.parse_args()
-    update_meetings(api_key=args.api_key)
+    update_meetings(api_key=args.api_key, dry_run=args.dry_run)
